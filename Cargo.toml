@@ -7,4 +7,3 @@ edition = "2021"
 pedantic = "warn"
 
 [dependencies]
-futures = "0.3"

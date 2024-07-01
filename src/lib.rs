@@ -1,102 +1,118 @@
-use futures::task::{waker, ArcWake};
 use std::{
     future::Future,
     pin::Pin,
     sync::{
-        mpsc::{channel, Sender},
+        mpsc::{channel, Receiver, Sender},
         Arc, Mutex,
     },
-    task::{Context, Poll},
+    task::{Context, Poll, Wake, Waker},
     thread::{self, sleep},
     time::Instant,
 };
 
-pub fn block_on(future: impl Future<Output = ()> + Send + 'static) {
-    let (scheduler, schedule) = channel();
-    Arc::new(Task::new(scheduler, future)).schedule();
-    while let Ok(task) = schedule.recv() {
-        task.poll();
+pub struct Rt {
+    spawner: Sender<Arc<Task>>,
+    executor: Receiver<Arc<Task>>,
+}
+
+impl Rt {
+    #[must_use]
+    pub fn new() -> Self {
+        let (spawner, executor) = channel();
+        Self { spawner, executor }
+    }
+
+    pub fn run(self) {
+        drop(self.spawner);
+        while let Ok(task) = self.executor.recv() {
+            task.poll();
+        }
+    }
+
+    #[must_use]
+    pub fn spawner(&self) -> &Sender<Arc<Task>> {
+        &self.spawner
     }
 }
 
-struct TaskFuture {
-    future: Pin<Box<dyn Future<Output = ()> + Send>>,
-    poll: Poll<()>,
+impl Default for Rt {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-struct Task {
-    task_future: Mutex<TaskFuture>,
-    scheduler: Sender<Arc<Self>>,
+/// # Panics
+///
+/// When an executor corresponding to the spawner has been dropped.
+pub fn spawn(
+    spawner: &Sender<Arc<Task>>,
+    future: impl Future<Output = ()> + Send + 'static,
+) -> Join {
+    let task = Arc::new(Task::new(spawner.clone(), future));
+    let join = task.join.clone();
+    // It is achievable panic, but it was chosen because of ergonomics.
+    spawner.send(task).unwrap();
+    join
+}
+
+#[derive(Clone)]
+pub struct Join {
+    waker: Arc<Mutex<Option<Waker>>>,
+    completed: Arc<Mutex<bool>>,
+}
+
+pub struct Task {
+    future: Mutex<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    spawner: Sender<Arc<Self>>,
+    join: Join,
 }
 
 impl Task {
-    fn new(
-        scheduler: Sender<Arc<Task>>,
-        future: impl Future<Output = ()> + Send + 'static,
-    ) -> Self {
+    fn new(spawner: Sender<Arc<Task>>, future: impl Future<Output = ()> + Send + 'static) -> Self {
         Self {
-            task_future: Mutex::new(TaskFuture {
-                future: Box::pin(future),
-                poll: Poll::Pending,
-            }),
-            scheduler,
+            future: Mutex::new(Box::pin(future)),
+            spawner,
+            join: Join {
+                waker: Mutex::new(None).into(),
+                completed: Mutex::new(false).into(),
+            },
         }
-    }
-
-    fn schedule(self: &Arc<Self>) {
-        self.scheduler.send(self.clone()).unwrap();
     }
 
     fn poll(self: &Arc<Self>) {
-        let mut task_future = self.task_future.try_lock().unwrap();
-        if task_future.poll.is_pending() {
-            task_future.poll = task_future
+        if !*self.join.completed.try_lock().unwrap() {
+            if let Poll::Ready(()) = self
                 .future
+                .try_lock()
+                .unwrap()
                 .as_mut()
-                .poll(&mut Context::from_waker(&waker(self.clone())));
+                .poll(&mut Context::from_waker(&Waker::from(self.clone())))
+            {
+                if let Some(waker) = &mut *self.join.waker.try_lock().unwrap() {
+                    waker.wake_by_ref();
+                }
+                *self.join.completed.try_lock().unwrap() = true;
+            }
         }
     }
 }
 
-impl ArcWake for Task {
-    fn wake_by_ref(arc_self: &Arc<Self>) {
-        arc_self.schedule();
-    }
-}
-
-pub struct Join {
-    a: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
-    b: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
-}
-
-impl Join {
-    pub fn new(
-        a: impl Future<Output = ()> + Send + 'static,
-        b: impl Future<Output = ()> + Send + 'static,
-    ) -> Self {
-        Self {
-            a: Some(Box::pin(a)),
-            b: Some(Box::pin(b)),
-        }
+impl Wake for Task {
+    fn wake(self: Arc<Self>) {
+        self.spawner.send(self.clone()).unwrap();
     }
 }
 
 impl Future for Join {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(ref mut a) = self.a {
-            if a.as_mut().poll(cx).is_ready() {
-                self.a.take();
-            }
-        }
-        if let Some(ref mut b) = self.b {
-            if b.as_mut().poll(cx).is_ready() {
-                self.b.take();
-            }
-        }
-        if self.a.is_none() && self.b.is_none() {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if *self.completed.try_lock().unwrap() {
             return Poll::Ready(());
+        }
+        let mut join_waker = self.waker.try_lock().unwrap();
+        if (*join_waker).is_none() {
+            *join_waker = Some(cx.waker().clone());
         }
         Poll::Pending
     }
@@ -130,40 +146,79 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn block_on_unit_future() {
-        block_on(async {
-            println!("hey");
-        });
+    fn run_unit_future() {
+        let rt = Rt::new();
+        spawn(rt.spawner(), async { println!("hey") });
+        rt.run();
     }
 
     #[test]
-    fn block_on_bool_future() {
+    fn run_bool_future() {
         #[allow(clippy::unused_async)]
         async fn bool_future() -> bool {
             true
         }
-        block_on(async { println!("{}", bool_future().await) });
+        let rt = Rt::new();
+        spawn(rt.spawner(), async { println!("{}", bool_future().await) });
+        rt.run();
     }
 
     #[test]
-    fn join() {
-        block_on(async {
-            Join::new(
+    fn concurrent_run() {
+        let rt = Rt::new();
+        spawn(
+            rt.spawner(),
+            Alarm {
+                instant: Instant::now() + Duration::new(5, 0),
+            },
+        );
+        spawn(
+            rt.spawner(),
+            Alarm {
+                instant: Instant::now() + Duration::new(1, 0),
+            },
+        );
+        rt.run();
+    }
+
+    #[test]
+    fn nested_spawn() {
+        let rt = Rt::new();
+        let cloned_spawner = rt.spawner().clone();
+        spawn(rt.spawner(), async move {
+            spawn(&cloned_spawner, async move {
+                println!("hey");
+            });
+        });
+        rt.run();
+    }
+
+    #[test]
+    fn join_run() {
+        let rt = Rt::new();
+        let cloned_spawner = rt.spawner().clone();
+        spawn(rt.spawner(), async move {
+            let join = spawn(
+                &cloned_spawner,
                 Alarm {
                     instant: Instant::now() + Duration::new(5, 0),
                 },
-                Alarm {
-                    instant: Instant::now() + Duration::new(1, 0),
-                },
-            )
-            .await;
+            );
+            join.await;
+            println!("hey");
         });
+        rt.run();
     }
 
     #[test]
     fn alarm() {
-        block_on(Alarm {
-            instant: Instant::now() + Duration::new(3, 0),
-        });
+        let rt = Rt::new();
+        spawn(
+            rt.spawner(),
+            Alarm {
+                instant: Instant::now() + Duration::new(3, 0),
+            },
+        );
+        rt.run();
     }
 }
