@@ -11,8 +11,8 @@ use std::{
 };
 
 pub struct Rt {
-    spawner: Sender<Arc<Task>>,
-    executor: Receiver<Arc<Task>>,
+    spawner: Sender<Arc<dyn TaskTrait>>,
+    executor: Receiver<Arc<dyn TaskTrait>>,
 }
 
 impl Rt {
@@ -30,7 +30,7 @@ impl Rt {
     }
 
     #[must_use]
-    pub fn spawner(&self) -> &Sender<Arc<Task>> {
+    pub fn spawner(&self) -> &Sender<Arc<dyn TaskTrait>> {
         &self.spawner
     }
 }
@@ -44,10 +44,11 @@ impl Default for Rt {
 /// # Panics
 ///
 /// When an executor corresponding to the spawner has been dropped.
-pub fn spawn(
-    spawner: &Sender<Arc<Task>>,
-    future: impl Future<Output = ()> + Send + 'static,
-) -> Join {
+pub fn spawn<T>(spawner: &Sender<Arc<dyn TaskTrait>>, future: T) -> Join<T::Output>
+where
+    T: Future + Send + 'static,
+    T::Output: Send,
+{
     let task = Arc::new(Task::new(spawner.clone(), future));
     let join = task.join.clone();
     // It is achievable panic, but it was chosen because of ergonomics.
@@ -55,33 +56,41 @@ pub fn spawn(
     join
 }
 
-#[derive(Clone)]
-pub struct Join {
-    waker: Arc<Mutex<Option<Waker>>>,
-    completed: Arc<Mutex<bool>>,
+pub struct Task<T: Future> {
+    future: Mutex<Pin<Box<T>>>,
+    spawner: Sender<Arc<dyn TaskTrait>>,
+    join: Join<T::Output>,
 }
 
-pub struct Task {
-    future: Mutex<Pin<Box<dyn Future<Output = ()> + Send>>>,
-    spawner: Sender<Arc<Self>>,
-    join: Join,
-}
-
-impl Task {
-    fn new(spawner: Sender<Arc<Task>>, future: impl Future<Output = ()> + Send + 'static) -> Self {
+impl<T: Future> Task<T> {
+    fn new(spawner: Sender<Arc<dyn TaskTrait>>, future: T) -> Self {
         Self {
             future: Mutex::new(Box::pin(future)),
             spawner,
             join: Join {
                 waker: Mutex::new(None).into(),
-                completed: Mutex::new(false).into(),
+                poll: Mutex::new(Some(Poll::Pending)).into(),
             },
         }
     }
+}
 
-    fn poll(self: &Arc<Self>) {
-        if !*self.join.completed.try_lock().unwrap() {
-            if let Poll::Ready(()) = self
+pub trait TaskTrait: Send + Sync {
+    fn poll(self: Arc<Self>);
+}
+
+impl<T> TaskTrait for Task<T>
+where
+    T: Future + Send + 'static,
+    T::Output: Send,
+{
+    fn poll(self: Arc<Self>) {
+        if if let Some(poll) = &mut *self.join.poll.try_lock().unwrap() {
+            poll.is_pending()
+        } else {
+            false
+        } {
+            if let Poll::Ready(output) = self
                 .future
                 .try_lock()
                 .unwrap()
@@ -91,30 +100,52 @@ impl Task {
                 if let Some(waker) = &mut *self.join.waker.try_lock().unwrap() {
                     waker.wake_by_ref();
                 }
-                *self.join.completed.try_lock().unwrap() = true;
+                *self.join.poll.try_lock().unwrap() = Some(Poll::Ready(output));
             }
         }
     }
 }
 
-impl Wake for Task {
+impl<T> Wake for Task<T>
+where
+    T: Future + Send + 'static,
+    T::Output: Send,
+{
     fn wake(self: Arc<Self>) {
         self.spawner.send(self.clone()).unwrap();
     }
 }
 
-impl Future for Join {
-    type Output = ();
+pub struct Join<T> {
+    waker: Arc<Mutex<Option<Waker>>>,
+    poll: Arc<Mutex<Option<Poll<T>>>>,
+}
+
+impl<T> Future for Join<T> {
+    type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if *self.completed.try_lock().unwrap() {
-            return Poll::Ready(());
+        let mut poll_slot = self.poll.try_lock().unwrap();
+        if let Some(poll) = &mut *poll_slot {
+            if poll.is_ready() {
+                return poll_slot.take().unwrap();
+            }
         }
         let mut join_waker = self.waker.try_lock().unwrap();
         if (*join_waker).is_none() {
             *join_waker = Some(cx.waker().clone());
         }
         Poll::Pending
+    }
+}
+
+// Manual impl because of unnecessary derive bounds
+impl<T> Clone for Join<T> {
+    fn clone(&self) -> Self {
+        Join {
+            waker: self.waker.clone(),
+            poll: self.poll.clone(),
+        }
     }
 }
 
@@ -206,6 +237,54 @@ mod tests {
             );
             join.await;
             println!("hey");
+        });
+        rt.run();
+    }
+
+    #[test]
+    fn join_bool_future() {
+        #[allow(clippy::unused_async)]
+        async fn bool_future() -> bool {
+            true
+        }
+        let rt = Rt::new();
+        let join = spawn(rt.spawner(), bool_future());
+        spawn(rt.spawner(), async {
+            println!("{}", join.await);
+        });
+        rt.run();
+    }
+
+    #[test]
+    fn join_nested_bool_future() {
+        #[allow(clippy::unused_async)]
+        async fn bool_future() -> bool {
+            true
+        }
+        let rt = Rt::new();
+        let cloned_spawner = rt.spawner().clone();
+        spawn(rt.spawner(), async move {
+            let join = spawn(&cloned_spawner, bool_future());
+            println!("{}", join.await);
+        });
+        rt.run();
+    }
+
+    #[test]
+    fn join_delayed_bool_future() {
+        #[allow(clippy::unused_async)]
+        async fn bool_future() -> bool {
+            Alarm {
+                instant: Instant::now() + Duration::new(3, 0),
+            }
+            .await;
+            true
+        }
+        let rt = Rt::new();
+        let cloned_spawner = rt.spawner().clone();
+        spawn(rt.spawner(), async move {
+            let join = spawn(&cloned_spawner, bool_future());
+            println!("{}", join.await);
         });
         rt.run();
     }
