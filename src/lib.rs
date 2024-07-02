@@ -70,6 +70,7 @@ impl<T: Future> Task<T> {
             join: Join {
                 waker: Mutex::new(None).into(),
                 poll: Mutex::new(Some(Poll::Pending)).into(),
+                cancelled: Mutex::new(false).into(),
             },
         }
     }
@@ -85,6 +86,10 @@ where
     T::Output: Send,
 {
     fn poll(self: Arc<Self>) {
+        // It would be better if the Context could store the cancelled flag to signal futures
+        if *self.join.cancelled.try_lock().unwrap() {
+            return;
+        }
         if if let Some(poll) = &mut *self.join.poll.try_lock().unwrap() {
             poll.is_pending()
         } else {
@@ -119,12 +124,23 @@ where
 pub struct Join<T> {
     waker: Arc<Mutex<Option<Waker>>>,
     poll: Arc<Mutex<Option<Poll<T>>>>,
+    cancelled: Arc<Mutex<bool>>,
+}
+
+impl<T> Join<T> {
+    // NOTE: the panic belongs to Mutexes and Arcs, so I'll put it off for later
+    pub fn cancel(&self) {
+        *self.cancelled.try_lock().unwrap() = true;
+    }
 }
 
 impl<T> Future for Join<T> {
     type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if *self.cancelled.try_lock().unwrap() {
+            return Poll::Pending;
+        }
         let mut poll_slot = self.poll.try_lock().unwrap();
         if let Some(poll) = &mut *poll_slot {
             if poll.is_ready() {
@@ -145,6 +161,7 @@ impl<T> Clone for Join<T> {
         Join {
             waker: self.waker.clone(),
             poll: self.poll.clone(),
+            cancelled: self.cancelled.clone(),
         }
     }
 }
@@ -285,6 +302,39 @@ mod tests {
         spawn(rt.spawner(), async move {
             let join = spawn(&cloned_spawner, bool_future());
             println!("{}", join.await);
+        });
+        rt.run();
+    }
+
+    #[test]
+    fn cancel() {
+        let rt = Rt::new();
+        let cloned_spawner = rt.spawner().clone();
+        spawn(rt.spawner(), async move {
+            let join = spawn(
+                &cloned_spawner,
+                Alarm {
+                    instant: Instant::now() + Duration::new(5, 0),
+                },
+            );
+            join.cancel();
+        });
+        rt.run();
+    }
+
+    #[test]
+    fn cancel_with_await() {
+        let rt = Rt::new();
+        let cloned_spawner = rt.spawner().clone();
+        spawn(rt.spawner(), async move {
+            let join = spawn(
+                &cloned_spawner,
+                Alarm {
+                    instant: Instant::now() + Duration::new(5, 0),
+                },
+            );
+            join.cancel();
+            join.await;
         });
         rt.run();
     }
