@@ -7,11 +7,12 @@ use std::{
     },
     task::{Context, Poll, Wake, Waker},
     thread::{self, sleep},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
+/// Runtime
 pub struct Rt {
-    spawner: Sender<Arc<dyn TaskTrait>>,
+    spawner: Spawner,
     executor: Receiver<Arc<dyn TaskTrait>>,
 }
 
@@ -19,7 +20,10 @@ impl Rt {
     #[must_use]
     pub fn new() -> Self {
         let (spawner, executor) = channel();
-        Self { spawner, executor }
+        Self {
+            spawner: Spawner(spawner),
+            executor,
+        }
     }
 
     pub fn run(self) {
@@ -30,7 +34,7 @@ impl Rt {
     }
 
     #[must_use]
-    pub fn spawner(&self) -> &Sender<Arc<dyn TaskTrait>> {
+    pub fn spawner(&self) -> &Spawner {
         &self.spawner
     }
 }
@@ -41,42 +45,53 @@ impl Default for Rt {
     }
 }
 
-/// # Panics
-///
-/// When an executor corresponding to the spawner has been dropped.
-pub fn spawn<T>(spawner: &Sender<Arc<dyn TaskTrait>>, future: T) -> Join<T::Output>
-where
-    T: Future + Send + 'static,
-    T::Output: Send,
-{
-    let task = Arc::new(Task::new(spawner.clone(), future));
-    let join = task.join.clone();
-    // It is achievable panic, but it was chosen because of ergonomics.
-    spawner.send(task).unwrap();
-    join
+#[derive(Clone)]
+pub struct Spawner(Sender<Arc<dyn TaskTrait>>);
+
+impl Spawner {
+    /// # Panics
+    ///
+    /// When an executor corresponding to the spawner has been dropped.
+    pub fn spawn<T>(&self, future: T) -> Join<T::Output>
+    where
+        T: Future + Send + 'static,
+        T::Output: Send,
+    {
+        let task = Arc::new(Task::new(self.clone(), future));
+        let join = private_clone(&task.join);
+        // It is achievable panic, but it was chosen because of ergonomics.
+        self.0.send(task).unwrap();
+        join
+    }
 }
 
-pub struct Task<T: Future> {
+// All mutexes are redundant, since the rt is single-threaded,
+// but are kept for assurance. So a Task invariant is,
+// that it can access inner data without locking.
+struct Task<T: Future> {
     future: Mutex<Pin<Box<T>>>,
-    spawner: Sender<Arc<dyn TaskTrait>>,
+    spawner: Spawner,
     join: Join<T::Output>,
 }
 
 impl<T: Future> Task<T> {
-    fn new(spawner: Sender<Arc<dyn TaskTrait>>, future: T) -> Self {
+    fn new(spawner: Spawner, future: T) -> Self {
         Self {
             future: Mutex::new(Box::pin(future)),
             spawner,
-            join: Join {
-                waker: Mutex::new(None).into(),
-                poll: Mutex::new(Some(Poll::Pending)).into(),
-                cancelled: Mutex::new(false).into(),
-            },
+            join: Join(
+                Mutex::new(InnerJoin {
+                    waker: None,
+                    output: Some(Poll::Pending),
+                    cancelled: false,
+                })
+                .into(),
+            ),
         }
     }
 }
 
-pub trait TaskTrait: Send + Sync {
+trait TaskTrait: Send + Sync {
     fn poll(self: Arc<Self>);
 }
 
@@ -86,11 +101,12 @@ where
     T::Output: Send,
 {
     fn poll(self: Arc<Self>) {
-        // It would be better if the Context could store the cancelled flag to signal futures
-        if *self.join.cancelled.try_lock().unwrap() {
+        let mut join = self.join.0.try_lock().unwrap();
+        // It would be better if the Context could store the cancelled flag to signal futures.
+        if join.cancelled {
             return;
         }
-        if if let Some(poll) = &mut *self.join.poll.try_lock().unwrap() {
+        if if let Some(poll) = &mut join.output {
             poll.is_pending()
         } else {
             false
@@ -102,10 +118,10 @@ where
                 .as_mut()
                 .poll(&mut Context::from_waker(&Waker::from(self.clone())))
             {
-                if let Some(waker) = &mut *self.join.waker.try_lock().unwrap() {
+                if let Some(waker) = &mut join.waker {
                     waker.wake_by_ref();
                 }
-                *self.join.poll.try_lock().unwrap() = Some(Poll::Ready(output));
+                join.output = Some(Poll::Ready(output));
             }
         }
     }
@@ -117,20 +133,23 @@ where
     T::Output: Send,
 {
     fn wake(self: Arc<Self>) {
-        self.spawner.send(self.clone()).unwrap();
+        self.spawner.0.send(self.clone()).unwrap();
     }
 }
 
-pub struct Join<T> {
-    waker: Arc<Mutex<Option<Waker>>>,
-    poll: Arc<Mutex<Option<Poll<T>>>>,
-    cancelled: Arc<Mutex<bool>>,
+pub struct Join<T>(Arc<Mutex<InnerJoin<T>>>);
+
+struct InnerJoin<T> {
+    waker: Option<Waker>,
+    output: Option<Poll<T>>,
+    cancelled: bool,
 }
 
 impl<T> Join<T> {
-    // NOTE: the panic belongs to Mutexes and Arcs, so I'll put it off for later
-    pub fn cancel(&self) {
-        *self.cancelled.try_lock().unwrap() = true;
+    // Mut because of the Task-Mutex invariant.
+    #[allow(clippy::missing_panics_doc)]
+    pub fn cancel(&mut self) {
+        self.0.try_lock().unwrap().cancelled = true;
     }
 }
 
@@ -138,36 +157,40 @@ impl<T> Future for Join<T> {
     type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if *self.cancelled.try_lock().unwrap() {
+        let mut join = self.0.try_lock().unwrap();
+        if join.cancelled {
             return Poll::Pending;
         }
-        let mut poll_slot = self.poll.try_lock().unwrap();
-        if let Some(poll) = &mut *poll_slot {
+        if let Some(poll) = &mut join.output {
             if poll.is_ready() {
-                return poll_slot.take().unwrap();
+                return join.output.take().unwrap();
             }
         }
-        let mut join_waker = self.waker.try_lock().unwrap();
-        if (*join_waker).is_none() {
-            *join_waker = Some(cx.waker().clone());
+        if join.waker.is_none() {
+            join.waker = Some(cx.waker().clone());
         }
         Poll::Pending
     }
 }
 
+// It is private, because joins after clone could run simultaneously,
+// but it violates the Task-Mutex invariant.
 // Manual impl because of unnecessary derive bounds
-impl<T> Clone for Join<T> {
-    fn clone(&self) -> Self {
-        Join {
-            waker: self.waker.clone(),
-            poll: self.poll.clone(),
-            cancelled: self.cancelled.clone(),
-        }
-    }
+fn private_clone<T>(join: &Join<T>) -> Join<T> {
+    Join(join.0.clone())
 }
 
 pub struct Alarm {
-    pub instant: Instant,
+    instant: Instant,
+}
+
+impl Alarm {
+    #[must_use]
+    pub fn timer(secs: u64) -> Alarm {
+        Alarm {
+            instant: Instant::now() + Duration::new(secs, 0),
+        }
+    }
 }
 
 impl Future for Alarm {
@@ -191,67 +214,54 @@ impl Future for Alarm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
-    fn run_unit_future() {
+    fn spawn_t_1() {
         let rt = Rt::new();
-        spawn(rt.spawner(), async { println!("hey") });
+        rt.spawner().spawn(async { println!("hey") });
         rt.run();
     }
 
     #[test]
-    fn run_bool_future() {
+    fn spawn_t_2() {
         #[allow(clippy::unused_async)]
         async fn bool_future() -> bool {
             true
         }
         let rt = Rt::new();
-        spawn(rt.spawner(), async { println!("{}", bool_future().await) });
+        rt.spawner()
+            .spawn(async { println!("{}", bool_future().await) });
         rt.run();
     }
 
     #[test]
-    fn concurrent_run() {
+    fn spawn_t_3() {
         let rt = Rt::new();
-        spawn(
-            rt.spawner(),
-            Alarm {
-                instant: Instant::now() + Duration::new(5, 0),
-            },
-        );
-        spawn(
-            rt.spawner(),
-            Alarm {
-                instant: Instant::now() + Duration::new(1, 0),
-            },
-        );
+        rt.spawner().spawn(Alarm::timer(3));
+        rt.spawner().spawn(Alarm::timer(1));
         rt.run();
     }
 
     #[test]
-    fn nested_spawn() {
+    fn spawn_t_4() {
         let rt = Rt::new();
-        let cloned_spawner = rt.spawner().clone();
-        spawn(rt.spawner(), async move {
-            spawn(&cloned_spawner, async move {
-                println!("hey");
+        let spawner = rt.spawner().clone();
+        rt.spawner().spawn(async move {
+            spawner.spawn(async {
+                println!("before");
+                Alarm::timer(3).await;
             });
+            async { println!("first") }.await;
         });
         rt.run();
     }
 
     #[test]
-    fn join_run() {
+    fn join_t_1() {
         let rt = Rt::new();
-        let cloned_spawner = rt.spawner().clone();
-        spawn(rt.spawner(), async move {
-            let join = spawn(
-                &cloned_spawner,
-                Alarm {
-                    instant: Instant::now() + Duration::new(5, 0),
-                },
-            );
+        let spawner = rt.spawner().clone();
+        rt.spawner().spawn(async move {
+            let join = spawner.spawn(Alarm::timer(3));
             join.await;
             println!("hey");
         });
@@ -259,80 +269,67 @@ mod tests {
     }
 
     #[test]
-    fn join_bool_future() {
+    fn join_t_2() {
         #[allow(clippy::unused_async)]
         async fn bool_future() -> bool {
             true
         }
         let rt = Rt::new();
-        let join = spawn(rt.spawner(), bool_future());
-        spawn(rt.spawner(), async {
+        let join = rt.spawner().spawn(bool_future());
+        rt.spawner().spawn(async {
             println!("{}", join.await);
         });
         rt.run();
     }
 
     #[test]
-    fn join_nested_bool_future() {
+    fn join_t_3() {
         #[allow(clippy::unused_async)]
         async fn bool_future() -> bool {
             true
         }
         let rt = Rt::new();
-        let cloned_spawner = rt.spawner().clone();
-        spawn(rt.spawner(), async move {
-            let join = spawn(&cloned_spawner, bool_future());
+        let spawner = rt.spawner().clone();
+        rt.spawner().spawn(async move {
+            let join = spawner.spawn(bool_future());
             println!("{}", join.await);
         });
         rt.run();
     }
 
     #[test]
-    fn join_delayed_bool_future() {
+    fn join_t_4() {
         #[allow(clippy::unused_async)]
         async fn bool_future() -> bool {
-            Alarm {
-                instant: Instant::now() + Duration::new(3, 0),
-            }
-            .await;
+            Alarm::timer(3).await;
             true
         }
         let rt = Rt::new();
-        let cloned_spawner = rt.spawner().clone();
-        spawn(rt.spawner(), async move {
-            let join = spawn(&cloned_spawner, bool_future());
+        let spawner = rt.spawner().clone();
+        rt.spawner().spawn(async move {
+            let join = spawner.spawn(bool_future());
             println!("{}", join.await);
         });
         rt.run();
     }
 
     #[test]
-    fn cancel() {
+    fn cancel_t_1() {
         let rt = Rt::new();
-        let cloned_spawner = rt.spawner().clone();
-        spawn(rt.spawner(), async move {
-            let join = spawn(
-                &cloned_spawner,
-                Alarm {
-                    instant: Instant::now() + Duration::new(5, 0),
-                },
-            );
+        let spawner = rt.spawner().clone();
+        rt.spawner().spawn(async move {
+            let mut join = spawner.spawn(Alarm::timer(3));
             join.cancel();
         });
         rt.run();
     }
 
     #[test]
-    fn cancel_with_await() {
+    fn cancel_t_2() {
         let rt = Rt::new();
-        let cloned_spawner = rt.spawner().clone();
-        spawn(rt.spawner(), async move {
-            let join = spawn(
-                &cloned_spawner,
-                Alarm {
-                    instant: Instant::now() + Duration::new(5, 0),
-                },
-            );
+        let spawner = rt.spawner().clone();
+        rt.spawner().spawn(async move {
+            let mut join = spawner.spawn(Alarm::timer(3));
             join.cancel();
             join.await;
         });
@@ -340,14 +337,9 @@ mod tests {
     }
 
     #[test]
-    fn alarm() {
+    fn alarm_t_1() {
         let rt = Rt::new();
-        spawn(
-            rt.spawner(),
-            Alarm {
-                instant: Instant::now() + Duration::new(3, 0),
-            },
-        );
+        rt.spawner().spawn(Alarm::timer(3));
         rt.run();
     }
 }
