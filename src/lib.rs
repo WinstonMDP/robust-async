@@ -15,30 +15,109 @@ use std::{
 
 /// Runtime
 pub struct Rt {
-    spawner: Spawner,
-    executor: Receiver<Arc<dyn TaskTrait>>,
+    task_sender: Sender<Box<dyn TaskTrait>>,
+    send_task_sender: Sender<Box<dyn SendTaskTrait>>,
+    task_receiver: Receiver<Box<dyn TaskTrait>>,
+    send_task_receiver: Receiver<Box<dyn SendTaskTrait>>,
+    id_sender: Sender<Id>,
+    id_receiver: Receiver<Id>,
+    signal_sender: Sender<Signal>,
+    executor: Receiver<Signal>,
+    tasks: Vec<Option<Box<dyn TaskTrait>>>,
+    send_tasks: Vec<Option<Box<dyn SendTaskTrait>>>,
 }
 
 impl Rt {
     #[must_use]
     pub fn new() -> Self {
-        let (spawner, executor) = channel();
+        let (task_sender, task_receiver) = channel();
+        let (send_task_sender, send_task_receiver) = channel();
+        let (id_sender, id_receiver) = channel();
+        let (signal_sender, executor) = channel();
         Self {
-            spawner: Spawner(spawner),
+            task_sender,
+            send_task_sender,
+            task_receiver,
+            send_task_receiver,
+            id_sender,
+            id_receiver,
+            signal_sender,
             executor,
+            tasks: Vec::new(),
+            send_tasks: Vec::new(),
         }
     }
 
-    pub fn run(self) {
-        drop(self.spawner);
-        while let Ok(task) = self.executor.recv() {
-            task.poll();
+    #[allow(clippy::missing_panics_doc)]
+    pub fn run(mut self) {
+        drop(self.signal_sender);
+        let mut free_options = Vec::new();
+        while let Ok(signal) = self.executor.recv() {
+            let id = match signal {
+                Signal::Task => {
+                    let mut task = self.task_receiver.try_recv().unwrap();
+                    let id = Id {
+                        is_send: false,
+                        i: free_options.pop().unwrap_or(self.tasks.len()),
+                    };
+                    task.set_id(id.clone());
+                    if id.i == self.tasks.len() {
+                        self.tasks.push(Some(task));
+                    } else {
+                        self.tasks[id.i] = Some(task);
+                    }
+                    id
+                }
+                Signal::SendTask => {
+                    let mut task = self.send_task_receiver.try_recv().unwrap();
+                    let id = Id {
+                        is_send: true,
+                        i: free_options.pop().unwrap_or(self.tasks.len()),
+                    };
+                    task.set_id(id.clone());
+                    if id.i == self.tasks.len() {
+                        self.send_tasks.push(Some(task));
+                    } else {
+                        self.send_tasks[id.i] = Some(task);
+                    }
+                    id
+                }
+                Signal::Id => self.id_receiver.try_recv().unwrap(),
+            };
+            if id.is_send {
+                let task = self.send_tasks[id.i].as_ref().unwrap();
+                task.poll();
+                if task.is_completed() {
+                    self.send_tasks[id.i].take();
+                    free_options.push(id.i);
+                }
+            } else {
+                let task = self.tasks[id.i].as_ref().unwrap();
+                task.poll();
+                if task.is_completed() {
+                    self.tasks[id.i].take();
+                    free_options.push(id.i);
+                }
+            }
         }
     }
 
     #[must_use]
-    pub fn spawner(&self) -> &Spawner {
-        &self.spawner
+    pub fn spawner(&self) -> Spawner {
+        Spawner {
+            task_sender: self.task_sender.clone(),
+            id_sender: self.id_sender.clone(),
+            signal_sender: self.signal_sender.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn send_spawner(&self) -> SendSpawner {
+        SendSpawner {
+            task_sender: self.send_task_sender.clone(),
+            id_sender: self.id_sender.clone(),
+            signal_sender: self.signal_sender.clone(),
+        }
     }
 }
 
@@ -48,22 +127,64 @@ impl Default for Rt {
     }
 }
 
+trait TaskTrait {
+    fn poll(&self);
+    fn set_id(&mut self, id: Id);
+    fn is_completed(&self) -> bool;
+}
+
+trait SendTaskTrait: TaskTrait + Send + Sync {}
+
 #[derive(Clone)]
-pub struct Spawner(Sender<Arc<dyn TaskTrait>>);
+pub struct Spawner {
+    task_sender: Sender<Box<dyn TaskTrait>>,
+    id_sender: Sender<Id>,
+    signal_sender: Sender<Signal>,
+}
 
 impl Spawner {
     /// # Panics
     ///
     /// When an executor corresponding to the spawner has been dropped.
-    pub fn spawn<T>(&self, future: T) -> Join<T::Output>
-    where
-        T: Future + Send + 'static,
-        T::Output: Send,
-    {
-        let task = Arc::new(Task::new(self.clone(), future));
+    pub fn spawn<T: Future + 'static>(&self, future: T) -> Join<T::Output> {
+        let task = Box::new(Task::new(
+            self.id_sender.clone(),
+            self.signal_sender.clone(),
+            future,
+        ));
         let join = private_clone(&task.join);
         // It is achievable panic, but it was chosen because of ergonomics.
-        self.0.send(task).unwrap();
+        self.task_sender.send(task).unwrap();
+        self.signal_sender.send(Signal::Task).unwrap();
+        join
+    }
+}
+
+#[derive(Clone)]
+pub struct SendSpawner {
+    task_sender: Sender<Box<dyn SendTaskTrait>>,
+    id_sender: Sender<Id>,
+    signal_sender: Sender<Signal>,
+}
+
+impl SendSpawner {
+    /// # Panics
+    ///
+    /// When an executor corresponding to the spawner has been dropped.
+    pub fn spawn<T>(&self, future: T) -> Join<T::Output>
+    where
+        T: Future + 'static + Send + Sync,
+        T::Output: Send,
+    {
+        let task = Box::new(Task::new(
+            self.id_sender.clone(),
+            self.signal_sender.clone(),
+            future,
+        ));
+        let join = private_clone(&task.join);
+        // It is achievable panic, but it was chosen because of ergonomics.
+        self.task_sender.send(task).unwrap();
+        self.signal_sender.send(Signal::SendTask).unwrap();
         join
     }
 }
@@ -73,20 +194,23 @@ impl Spawner {
 // that it can access inner data without locking.
 struct Task<T: Future> {
     future: Mutex<Pin<Box<T>>>,
-    spawner: Spawner,
+    id: Option<Id>,
+    id_sender: Sender<Id>,
+    signal_sender: Sender<Signal>,
     join: Join<T::Output>,
 }
 
 impl<T: Future> Task<T> {
-    fn new(spawner: Spawner, future: T) -> Self {
+    fn new(id_sender: Sender<Id>, signal_sender: Sender<Signal>, future: T) -> Self {
         Self {
             future: Mutex::new(Box::pin(future)),
-            spawner,
+            id: None,
+            id_sender,
+            signal_sender,
             join: Join(
                 Mutex::new(InnerJoin {
                     waker: None,
-                    output: Some(Poll::Pending),
-                    cancelled: false,
+                    output: Poll::Pending,
                 })
                 .into(),
             ),
@@ -94,49 +218,67 @@ impl<T: Future> Task<T> {
     }
 }
 
-trait TaskTrait: Send + Sync {
-    fn poll(self: Arc<Self>);
-}
-
-impl<T> TaskTrait for Task<T>
-where
-    T: Future + Send + 'static,
-    T::Output: Send,
-{
-    fn poll(self: Arc<Self>) {
+impl<T: Future> TaskTrait for Task<T> {
+    fn poll(&self) {
         let mut join = self.join.0.try_lock().unwrap();
-        // It would be better if the Context could store the cancelled flag to signal futures.
-        if join.cancelled {
-            return;
-        }
-        if if let Some(poll) = &mut join.output {
-            poll.is_pending()
-        } else {
-            false
-        } {
-            if let Poll::Ready(output) = self
-                .future
-                .try_lock()
-                .unwrap()
-                .as_mut()
-                .poll(&mut Context::from_waker(&Waker::from(self.clone())))
+        if join.output.is_pending() {
+            if let Poll::Ready(output) =
+                self.future
+                    .try_lock()
+                    .unwrap()
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&Waker::from(Arc::new(IdWaker {
+                        id_sender: self.id_sender.clone(),
+                        id: self.id.clone().unwrap(),
+                        signal_sender: self.signal_sender.clone(),
+                    }))))
             {
                 if let Some(waker) = &mut join.waker {
                     waker.wake_by_ref();
                 }
-                join.output = Some(Poll::Ready(output));
+                join.output = Poll::Ready(Some(output));
             }
         }
     }
+
+    fn set_id(&mut self, id: Id) {
+        self.id = Some(id);
+    }
+
+    fn is_completed(&self) -> bool {
+        self.join.0.try_lock().unwrap().output.is_ready()
+    }
 }
 
-impl<T> Wake for Task<T>
+impl<T> SendTaskTrait for Task<T>
 where
-    T: Future + Send + 'static,
+    T: Future + Send + Sync,
     T::Output: Send,
 {
+}
+
+enum Signal {
+    Task,
+    SendTask,
+    Id,
+}
+
+#[derive(Clone)]
+struct Id {
+    is_send: bool,
+    i: usize,
+}
+
+struct IdWaker {
+    id_sender: Sender<Id>,
+    id: Id,
+    signal_sender: Sender<Signal>,
+}
+
+impl Wake for IdWaker {
     fn wake(self: Arc<Self>) {
-        self.spawner.0.send(self.clone()).unwrap();
+        self.id_sender.send(self.id.clone()).unwrap();
+        self.signal_sender.send(Signal::Id).unwrap();
     }
 }
 
@@ -144,30 +286,25 @@ pub struct Join<T>(Arc<Mutex<InnerJoin<T>>>);
 
 struct InnerJoin<T> {
     waker: Option<Waker>,
-    output: Option<Poll<T>>,
-    cancelled: bool,
+    output: Poll<Option<T>>,
 }
 
 impl<T> Join<T> {
     // Mut because of the Task-Mutex invariant.
+    // It would be better if the Context could store the cancelled flag to signal futures.
     #[allow(clippy::missing_panics_doc)]
     pub fn cancel(&mut self) {
-        self.0.try_lock().unwrap().cancelled = true;
+        self.0.try_lock().unwrap().output = Poll::Ready(None);
     }
 }
 
 impl<T> Future for Join<T> {
-    type Output = T;
+    type Output = Option<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut join = self.0.try_lock().unwrap();
-        if join.cancelled {
-            return Poll::Pending;
-        }
-        if let Some(poll) = &mut join.output {
-            if poll.is_ready() {
-                return join.output.take().unwrap();
-            }
+        if let Poll::Ready(poll) = &mut join.output {
+            return Poll::Ready(poll.take());
         }
         if join.waker.is_none() {
             join.waker = Some(cx.waker().clone());
@@ -355,6 +492,16 @@ mod tests {
     }
 
     #[test]
+    fn spawn_t_5() {
+        let rt = Rt::new();
+        let spawner = rt.send_spawner().clone();
+        rt.spawner().spawn(async move {
+            thread::spawn(move || spawner.spawn(Alarm::timer(3)));
+            Alarm::timer(3).await;
+        });
+    }
+
+    #[test]
     fn join_t_1() {
         let v = Arc::new(Mutex::new(Vec::new()));
         let rt = Rt::new();
@@ -383,7 +530,7 @@ mod tests {
         let rt = Rt::new();
         let join = rt.spawner().spawn(bool_future());
         rt.spawner().spawn(async {
-            *b.try_lock().unwrap() = join.await;
+            *b.try_lock().unwrap() = join.await.unwrap();
         });
         rt.run();
         assert!(*b.try_lock().unwrap());
@@ -401,7 +548,7 @@ mod tests {
         let c_b = b.clone();
         rt.spawner().spawn(async move {
             let join = spawner.spawn(bool_future());
-            *c_b.try_lock().unwrap() = join.await;
+            *c_b.try_lock().unwrap() = join.await.unwrap();
         });
         rt.run();
         assert!(*b.try_lock().unwrap());
@@ -420,7 +567,7 @@ mod tests {
         let c_b = b.clone();
         rt.spawner().spawn(async move {
             let join = spawner.spawn(bool_future());
-            *c_b.try_lock().unwrap() = join.await;
+            *c_b.try_lock().unwrap() = join.await.unwrap();
         });
         rt.run();
         assert!(*b.try_lock().unwrap());
