@@ -419,7 +419,7 @@ impl Future for Alarm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cmp::Ord;
+    use std::{cell::RefCell, cmp::Ord, rc::Rc};
 
     fn is_sorted<T: Clone + Ord>(a: &[T]) -> bool {
         let mut c = a.to_vec();
@@ -430,10 +430,10 @@ mod tests {
     #[test]
     fn spawn_t_1() {
         let rt = Rt::new();
-        let b = Box::leak(Box::new(Mutex::new(false)));
-        rt.spawner().spawn(async { *b.try_lock().unwrap() = true });
+        let b = Box::leak(Box::new(RefCell::new(false)));
+        rt.spawner().spawn(async { *b.borrow_mut() = true });
         rt.run();
-        assert!(*b.try_lock().unwrap());
+        assert!(*b.borrow());
     }
 
     #[test]
@@ -442,32 +442,32 @@ mod tests {
         async fn bool_future() -> bool {
             true
         }
-        let b = Box::leak(Box::new(Mutex::new(false)));
+        let b = Box::leak(Box::new(RefCell::new(false)));
         let rt = Rt::new();
         rt.spawner()
-            .spawn(async { *b.try_lock().unwrap() = bool_future().await });
+            .spawn(async { *b.borrow_mut() = bool_future().await });
         rt.run();
     }
 
     #[test]
     fn spawn_t_3() {
-        let v = Box::leak(Box::new(Mutex::new(Vec::new())));
+        let v = Box::leak(Box::new(RefCell::new(Vec::new())));
         let rt = Rt::new();
         rt.spawner().spawn(async {
             Alarm::timer(3).await;
-            v.try_lock().unwrap().push(1);
+            v.borrow_mut().push(1);
         });
         rt.spawner().spawn(async {
             Alarm::timer(1).await;
-            v.try_lock().unwrap().push(0);
+            v.borrow_mut().push(0);
         });
         rt.run();
-        assert!(is_sorted(&v.try_lock().unwrap()));
+        assert!(is_sorted(&v.borrow()));
     }
 
     #[test]
     fn spawn_t_4() {
-        let v = Arc::new(Mutex::new(Vec::new()));
+        let v = Rc::new(RefCell::new(Vec::new()));
         let rt = Rt::new();
         let spawner = rt.spawner().clone();
         let c_v = v.clone();
@@ -475,12 +475,12 @@ mod tests {
             let c_c_v = c_v.clone();
             spawner.spawn(async move {
                 Alarm::timer(3).await;
-                c_c_v.try_lock().unwrap().push(1);
+                c_c_v.borrow_mut().push(1);
             });
-            async move { c_v.try_lock().unwrap().push(0) }.await;
+            async move { c_v.borrow_mut().push(0) }.await;
         });
         rt.run();
-        assert!(is_sorted(&v.try_lock().unwrap()));
+        assert!(is_sorted(&v.borrow()));
     }
 
     #[test]
@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn join_t_1() {
-        let v = Arc::new(Mutex::new(Vec::new()));
+        let v = Rc::new(RefCell::new(Vec::new()));
         let rt = Rt::new();
         let spawner = rt.spawner().clone();
         let c_v = v.clone();
@@ -503,13 +503,13 @@ mod tests {
             let c_c_v = c_v.clone();
             let join = spawner.spawn(async move {
                 Alarm::timer(3).await;
-                c_c_v.try_lock().unwrap().push(0);
+                c_c_v.borrow_mut().push(0);
             });
             join.await;
-            c_v.try_lock().unwrap().push(1);
+            c_v.borrow_mut().push(1);
         });
         rt.run();
-        assert!(is_sorted(&v.try_lock().unwrap()));
+        assert!(is_sorted(&v.borrow()));
     }
 
     #[test]
@@ -518,14 +518,14 @@ mod tests {
         async fn bool_future() -> bool {
             true
         }
-        let b = Box::leak(Box::new(Mutex::new(false)));
+        let b = Box::leak(Box::new(RefCell::new(false)));
         let rt = Rt::new();
         let join = rt.spawner().spawn(bool_future());
         rt.spawner().spawn(async {
-            *b.try_lock().unwrap() = join.await.unwrap();
+            *b.borrow_mut() = join.await.unwrap();
         });
         rt.run();
-        assert!(*b.try_lock().unwrap());
+        assert!(*b.borrow_mut());
     }
 
     #[test]
@@ -534,16 +534,16 @@ mod tests {
         async fn bool_future() -> bool {
             true
         }
-        let b = Arc::new(Mutex::new(false));
+        let b = Rc::new(RefCell::new(false));
         let rt = Rt::new();
         let spawner = rt.spawner().clone();
         let c_b = b.clone();
         rt.spawner().spawn(async move {
             let join = spawner.spawn(bool_future());
-            *c_b.try_lock().unwrap() = join.await.unwrap();
+            *c_b.borrow_mut() = join.await.unwrap();
         });
         rt.run();
-        assert!(*b.try_lock().unwrap());
+        assert!(*b.borrow());
     }
 
     #[test]
@@ -553,51 +553,51 @@ mod tests {
             Alarm::timer(3).await;
             true
         }
-        let b = Arc::new(Mutex::new(false));
+        let b = Rc::new(RefCell::new(false));
         let rt = Rt::new();
         let spawner = rt.spawner().clone();
         let c_b = b.clone();
         rt.spawner().spawn(async move {
             let join = spawner.spawn(bool_future());
-            *c_b.try_lock().unwrap() = join.await.unwrap();
+            *c_b.borrow_mut() = join.await.unwrap();
         });
         rt.run();
-        assert!(*b.try_lock().unwrap());
+        assert!(*b.borrow_mut());
     }
 
     #[test]
     fn cancel_t_1() {
-        let b = Arc::new(Mutex::new(false));
+        let b = Rc::new(RefCell::new(false));
         let rt = Rt::new();
         let spawner = rt.spawner().clone();
         let c_b = b.clone();
         rt.spawner().spawn(async move {
             let mut join = spawner.spawn(async move {
                 Alarm::timer(3).await;
-                *c_b.try_lock().unwrap() = true;
+                *c_b.borrow_mut() = true;
             });
             join.cancel();
         });
         rt.run();
-        assert!(!*b.try_lock().unwrap());
+        assert!(!*b.borrow());
     }
 
     #[test]
     fn cancel_t_2() {
-        let b = Arc::new(Mutex::new(false));
+        let b = Rc::new(RefCell::new(false));
         let rt = Rt::new();
         let spawner = rt.spawner().clone();
         let c_b = b.clone();
         rt.spawner().spawn(async move {
             let mut join = spawner.spawn(async move {
                 Alarm::timer(3).await;
-                *c_b.try_lock().unwrap() = true;
+                *c_b.borrow_mut() = true;
             });
             join.cancel();
             join.await;
         });
         rt.run();
-        assert!(!*b.try_lock().unwrap());
+        assert!(!*b.borrow());
     }
 
     #[test]
