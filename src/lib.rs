@@ -320,37 +320,36 @@ fn private_clone<T>(join: &Join<T>) -> Join<T> {
     Join(join.0.clone())
 }
 
-pub struct AsyncMutex<T>(Arc<UnsafeCell<InnerAsyncMutex<T>>>);
+pub struct AsyncMutex<T>(UnsafeCell<InnerAsyncMutex<T>>);
 
 impl<T> AsyncMutex<T> {
     pub fn new(t: T) -> Self {
-        Self(
-            UnsafeCell::new(InnerAsyncMutex {
-                t,
-                lock: false,
-                wakers: VecDeque::new(),
-            })
-            .into(),
-        )
+        Self(UnsafeCell::new(InnerAsyncMutex {
+            t,
+            lock: false,
+            wakers: VecDeque::new(),
+        }))
     }
 
     #[must_use]
     pub fn lock(&self) -> AsyncLock<T> {
-        AsyncLock(self.0.clone())
+        AsyncLock(self)
     }
 }
 
-pub struct AsyncLock<T>(Arc<UnsafeCell<InnerAsyncMutex<T>>>);
+pub struct AsyncLock<'a, T>(&'a AsyncMutex<T>);
 
-impl<T> Future for AsyncLock<T> {
-    type Output = AsyncMutexGuard<T>;
+pub struct AsyncMutexGuard<'a, T>(AsyncLock<'a, T>);
+
+impl<'a, T> Future for AsyncLock<'a, T> {
+    type Output = AsyncMutexGuard<'a, T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if !(unsafe { &*self.0.get() }).lock {
-            (unsafe { &mut *self.0.get() }).lock = true;
-            return Poll::Ready(AsyncMutexGuard(self.0.clone()));
+        if !unsafe { &*self.0 .0.get() }.lock {
+            unsafe { &mut *self.0 .0.get() }.lock = true;
+            return Poll::Ready(AsyncMutexGuard(AsyncLock(self.0)));
         }
-        unsafe { &mut *self.0.get() }
+        unsafe { &mut *self.0 .0.get() }
             .wakers
             .push_back(cx.waker().clone());
         Poll::Pending
@@ -363,33 +362,26 @@ struct InnerAsyncMutex<T> {
     wakers: VecDeque<Waker>,
 }
 
-unsafe impl<T> Send for AsyncMutex<T> {}
-unsafe impl<T> Send for AsyncLock<T> {}
-unsafe impl<T> Send for AsyncMutexGuard<T> {}
-unsafe impl<T> Sync for AsyncMutex<T> {}
-
-pub struct AsyncMutexGuard<T>(Arc<UnsafeCell<InnerAsyncMutex<T>>>);
-
-impl<T> Deref for AsyncMutexGuard<T> {
+impl<T> Deref for AsyncMutexGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        &unsafe { &*self.0.get() }.t
+        &unsafe { &*self.0 .0 .0.get() }.t
     }
 }
 
-impl<T> DerefMut for AsyncMutexGuard<T> {
+impl<T> DerefMut for AsyncMutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut unsafe { &mut *self.0.get() }.t
+        &mut unsafe { &mut *self.0 .0 .0.get() }.t
     }
 }
 
-impl<T> Drop for AsyncMutexGuard<T> {
+impl<T> Drop for AsyncMutexGuard<'_, T> {
     fn drop(&mut self) {
-        if let Some(waker) = unsafe { &mut *self.0.get() }.wakers.pop_front() {
+        if let Some(waker) = unsafe { &mut *self.0 .0 .0.get() }.wakers.pop_front() {
             waker.wake();
         }
-        unsafe { &mut *self.0.get() }.lock = false;
+        unsafe { &mut *self.0 .0 .0.get() }.lock = false;
     }
 }
 
@@ -610,24 +602,25 @@ mod tests {
 
     #[test]
     fn async_mutex_t_1() {
-        let v = Arc::new(Mutex::new(Vec::new()));
+        let v = Rc::new(RefCell::new(Vec::new()));
         let rt = Rt::new();
         let spawner = rt.spawner().clone();
-        let async_mutex = Arc::new(AsyncMutex::new(()));
+        let async_mutex = Rc::new(AsyncMutex::new(()));
         let c_v = v.clone();
         rt.spawner().spawn(async move {
             let async_mutex = async_mutex.clone();
             let _guard = async_mutex.lock().await;
+            let async_mutex = async_mutex.clone();
             let c_c_v = c_v.clone();
             spawner.spawn(async move {
                 async_mutex.lock().await;
-                c_c_v.try_lock().unwrap().push(1);
+                c_c_v.borrow_mut().push(1);
             });
             Alarm::timer(3).await;
-            c_v.try_lock().unwrap().push(0);
+            c_v.borrow_mut().push(0);
         });
         rt.run();
-        assert!(is_sorted(&v.try_lock().unwrap()));
+        assert!(is_sorted(&v.borrow()));
     }
 
     #[test]
