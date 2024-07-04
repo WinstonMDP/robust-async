@@ -52,6 +52,7 @@ impl Rt {
     pub fn run(mut self) {
         drop(self.signal_sender);
         let mut free_options = Vec::new();
+        let mut send_free_options = Vec::new();
         while let Ok(signal) = self.executor.recv() {
             let id = match signal {
                 Signal::Task => {
@@ -72,10 +73,10 @@ impl Rt {
                     let mut task = self.send_task_receiver.try_recv().unwrap();
                     let id = Id {
                         is_send: true,
-                        i: free_options.pop().unwrap_or(self.tasks.len()),
+                        i: send_free_options.pop().unwrap_or(self.send_tasks.len()),
                     };
                     task.set_id(id.clone());
-                    if id.i == self.tasks.len() {
+                    if id.i == self.send_tasks.len() {
                         self.send_tasks.push(Some(task));
                     } else {
                         self.send_tasks[id.i] = Some(task);
@@ -89,7 +90,7 @@ impl Rt {
                 task.poll();
                 if task.is_completed() {
                     self.send_tasks[id.i].take();
-                    free_options.push(id.i);
+                    send_free_options.push(id.i);
                 }
             } else {
                 let task = self.tasks[id.i].as_ref().unwrap();
@@ -488,9 +489,12 @@ mod tests {
         let rt = Rt::new();
         let spawner = rt.send_spawner().clone();
         rt.spawner().spawn(async move {
-            thread::spawn(move || spawner.spawn(Alarm::timer(3)));
-            Alarm::timer(3).await;
+            let join = thread::spawn(move || spawner.spawn(Alarm::timer(3)))
+                .join()
+                .unwrap();
+            join.await;
         });
+        rt.run();
     }
 
     #[test]
