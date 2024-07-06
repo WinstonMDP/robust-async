@@ -61,14 +61,14 @@ mod tests {
         rt.run();
     }
 
-    struct Empty {}
-
-    impl Wake for Empty {
-        fn wake(self: std::sync::Arc<Self>) {}
-    }
-
     #[test]
     fn alarm_t_2() {
+        struct Empty {}
+
+        impl Wake for Empty {
+            fn wake(self: std::sync::Arc<Self>) {}
+        }
+
         let rt = Rt::new();
         let mut alarm = Alarm::timer(3);
         let _future =

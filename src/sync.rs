@@ -71,7 +71,7 @@ impl<T> Drop for AsyncMutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{io::Alarm, rt::Rt};
+    use crate::{io::Alarm, rt::Rt, test_utils::is_sorted};
     use std::{cell::RefCell, rc::Rc};
 
     #[test]
@@ -94,6 +94,6 @@ mod tests {
             c_v.borrow_mut().push(0);
         });
         rt.run();
-        assert!(crate::test_utils::is_sorted(&v.borrow()));
+        assert!(is_sorted(&v.borrow()));
     }
 }

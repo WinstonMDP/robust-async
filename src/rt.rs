@@ -58,7 +58,7 @@ impl Rt {
         let mut send_free_options = Vec::new();
         while let Ok(signal) = self.executor.recv() {
             let id = match signal {
-                Signal::Task => {
+                Signal::SpawnTask => {
                     let mut task = self.task_receiver.try_recv().unwrap();
                     let id = Id {
                         is_send: false,
@@ -72,7 +72,7 @@ impl Rt {
                     }
                     id
                 }
-                Signal::SendTask => {
+                Signal::SpawnSendTask => {
                     let mut task = self.send_task_receiver.try_recv().unwrap();
                     let id = Id {
                         is_send: true,
@@ -86,7 +86,7 @@ impl Rt {
                     }
                     id
                 }
-                Signal::Id => self.id_receiver.try_recv().unwrap(),
+                Signal::Wake => self.id_receiver.try_recv().unwrap(),
             };
             if id.is_send {
                 let task = self.send_tasks[id.i].as_ref().unwrap();
@@ -151,7 +151,7 @@ impl Spawner {
         let join = task.join.clone();
         // It is achievable panic, but it was chosen because of ergonomics.
         self.task_sender.send(task).unwrap();
-        self.signal_sender.send(Signal::Task).unwrap();
+        self.signal_sender.send(Signal::SpawnTask).unwrap();
         join
     }
 }
@@ -180,7 +180,7 @@ impl SendSpawner {
         let join = task.join.clone();
         // It is achievable panic, but it was chosen because of ergonomics.
         self.task_sender.send(task).unwrap();
-        self.signal_sender.send(Signal::SendTask).unwrap();
+        self.signal_sender.send(Signal::SpawnSendTask).unwrap();
         join
     }
 }
@@ -254,9 +254,9 @@ where
 }
 
 enum Signal {
-    Id,
-    SendTask,
-    Task,
+    SpawnSendTask,
+    SpawnTask,
+    Wake,
 }
 
 #[derive(Clone)]
@@ -274,7 +274,7 @@ struct IdWaker {
 impl Wake for IdWaker {
     fn wake(self: Arc<Self>) {
         self.id_sender.send(self.id.clone()).unwrap();
-        self.signal_sender.send(Signal::Id).unwrap();
+        self.signal_sender.send(Signal::Wake).unwrap();
     }
 }
 
