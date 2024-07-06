@@ -14,7 +14,7 @@ trait TaskTrait {
     fn is_completed(&self) -> bool;
 }
 
-trait SendTaskTrait: TaskTrait + Send + Sync {}
+trait SendTaskTrait: TaskTrait + Send {}
 
 /// Runtime
 pub struct Rt {
@@ -169,7 +169,7 @@ impl SendSpawner {
     /// When an executor corresponding to the spawner has been dropped.
     pub fn spawn<T>(&self, future: T) -> Join<T::Output>
     where
-        T: Future + 'static + Send + Sync,
+        T: Future + 'static + Send,
         T::Output: Send,
     {
         let task = Box::new(Task::new(
@@ -248,7 +248,7 @@ impl<T: Future> TaskTrait for Task<T> {
 
 impl<T> SendTaskTrait for Task<T>
 where
-    T: Future + Send + Sync,
+    T: Future + Send,
     T::Output: Send,
 {
 }
