@@ -4,13 +4,16 @@ use std::{
     future::Future,
     ops::{Deref, DerefMut},
     pin::Pin,
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
     task::{Context, Poll, Waker},
 };
 
 pub struct AsyncMutex<T> {
     t: UnsafeCell<T>,
-    lock: Mutex<bool>,
+    lock: AtomicBool,
     wakers: Mutex<VecDeque<Waker>>,
 }
 
@@ -30,15 +33,14 @@ impl<'a, T> Future for &'a AsyncMutex<T> {
     type Output = AsyncMutexGuard<'a, T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut lock = self.lock.lock().unwrap();
-        if !*lock {
-            *lock = true;
+        if self
+            .lock
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
             return Poll::Ready(AsyncMutexGuard(&self));
         }
-        self.wakers
-            .try_lock()
-            .unwrap()
-            .push_back(cx.waker().clone());
+        self.wakers.lock().unwrap().push_back(cx.waker().clone());
         Poll::Pending
     }
 }
@@ -64,7 +66,7 @@ impl<T> Drop for AsyncMutexGuard<'_, T> {
         if let Some(waker) = self.0.wakers.try_lock().unwrap().pop_front() {
             waker.wake();
         }
-        *self.0.lock.try_lock().unwrap() = false;
+        self.0.lock.store(false, Ordering::Release);
     }
 }
 
